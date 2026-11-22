@@ -273,6 +273,10 @@ class ClipSpec:
     texture_kind: str
     n_frames: int
     occluders: str  # "none" | "person" | "hand" | "full"
+    narrow: bool = False
+    cut_frame: int | None = None
+    move_after_cut: bool = False
+    hand_half: bool = False
 
 
 def camera_at(t: float, motion: str = "orbit") -> tuple[np.ndarray, np.ndarray]:
@@ -286,6 +290,34 @@ def camera_at(t: float, motion: str = "orbit") -> tuple[np.ndarray, np.ndarray]:
     target = np.array([0.04 * math.sin(2 * math.pi * t), 0.02 * math.cos(2 * math.pi * 1.3 * t), 0.0])
     roll = 6.5 * math.sin(2 * math.pi * 1.15 * t + 0.4)
     return c, look_at_rotation(c, target, roll)
+
+
+def narrow_camera_at(t: float) -> tuple[np.ndarray, np.ndarray]:
+    """Orbit toward a steep off-normal angle (mostly elevation/tilt) so the
+    projected screen collapses vertically into a thin band. Mid-clip the panel
+    is near edge-on, which is exactly the geometry that turns surviving
+    features into a near-collinear set."""
+    elev = math.radians(-6.0 + 62.0 * t)
+    radius = 2.45 + 0.05 * math.sin(2 * math.pi * t)
+    # moving in +y and +z tilts the view so the panel's vertical axis foreshortens
+    c = np.array([0.12 * math.sin(2 * math.pi * t), radius * math.sin(elev),
+                  radius * math.cos(elev)])
+    target = np.array([0.0, 0.0, 0.0])
+    roll = 2.0 * math.sin(2 * math.pi * t)
+    return c, look_at_rotation(c, target, roll)
+
+
+def moved_screen_homography(K: np.ndarray, R: np.ndarray, C: np.ndarray,
+                            offset: np.ndarray) -> np.ndarray:
+    """Screen homography after the physical panel is translated in its plane.
+
+    Used after a source cut where the display is also repositioned: the old
+    keyframe geometry no longer applies and tracking has to start a new leg.
+    """
+    t = -R @ C
+    A = np.column_stack([R[:, 0], R[:, 1], t + R @ offset])
+    H = K @ A @ _screen_texture_to_world()
+    return H / H[2, 2]
 
 
 def project_points(points_world: np.ndarray, K: np.ndarray, R: np.ndarray, C: np.ndarray) -> np.ndarray:
@@ -346,6 +378,37 @@ def warp_rgba(frame: np.ndarray, sprite: np.ndarray, H: np.ndarray) -> None:
     alpha = warped[:, :, 3:4].astype(np.float32) / 255.0
     src = warped[:, :, :3].astype(np.float32)
     frame[:] = np.clip(frame.astype(np.float32) * (1 - alpha) + src * alpha, 0, 255).astype(np.uint8)
+
+
+def _hand_half_window(frame_idx: int, n: int) -> tuple[int | None, int | None]:
+    """Frame window in which hands cover the screen except a thin band.
+
+    Centred on the steepest part of the narrow-angle orbit so the surviving
+    features are projected into a near-collinear band.
+    """
+    lo, hi = int(0.62 * n), int(0.86 * n)
+    if lo <= frame_idx <= hi:
+        return lo, hi
+    return None, None
+
+
+def make_cut_texture(seed: int = 71) -> np.ndarray:
+    """Visually distinct display material used after the source cut."""
+    rng = _rng(seed)
+    img = np.zeros((SCREEN_H, SCREEN_W, 3), np.uint8)
+    img[:] = (24, 18, 12)
+    cv2.rectangle(img, (0, 0), (SCREEN_W, 52), (150, 40, 30), -1)
+    cv2.putText(img, "BREAKING DESK", (18, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+    for k in range(6):
+        y = 80 + k * 42
+        cv2.rectangle(img, (24, y), (190, y + 28), (40, 90, 170), -1)
+        cv2.line(img, (210, y + 14), (SCREEN_W - 24, y + 14), (210, 210, 210), 2)
+    for _ in range(40):
+        x, y = int(rng.integers(0, SCREEN_W)), int(rng.integers(60, SCREEN_H))
+        cv2.circle(img, (x, y), int(rng.integers(2, 5)),
+                   tuple(int(c) for c in rng.integers(120, 255, 3)), -1)
+    img = np.clip(img.astype(np.float32) + rng.normal(0, 3.0, img.shape), 0, 255).astype(np.uint8)
+    return img
 
 
 def _occluder_state(spec: ClipSpec, frame_idx: int, n: int) -> dict:
@@ -431,7 +494,9 @@ def render_clip(outdir: str, spec: ClipSpec, seed: int = 5, encode: bool = True)
     hand = make_hand_sprite(seed=seed + 3)
     board = _make_board_sprite(seed=seed + 4)
     content = make_content_texture(seed=seed + 5)
+    cut_texture = make_cut_texture(seed=seed + 6)
     cv2.imwrite(os.path.join(outdir, "screen.png"), screen_tex)
+    cv2.imwrite(os.path.join(outdir, "cut_screen.png"), cut_texture)
     cv2.imwrite(os.path.join(outdir, "content.png"), content)
     cv2.imwrite(os.path.join(outdir, "person_sprite.png"), person)
 
@@ -445,7 +510,19 @@ def render_clip(outdir: str, spec: ClipSpec, seed: int = 5, encode: bool = True)
 
     for i in range(spec.n_frames):
         t = i / max(1, (spec.n_frames - 1))
-        C, R = camera_at(t, spec.name)
+        C, R = narrow_camera_at(t) if spec.narrow else camera_at(t, spec.name)
+        # Source cut: swap the displayed material at the cut frame. After the
+        # cut the panel can also be repositioned, so the old keyframe geometry
+        # and descriptors both stop applying.
+        active_tex = screen_tex
+        cut_now = spec.cut_frame is not None and i == spec.cut_frame
+        post_cut = spec.cut_frame is not None and i >= spec.cut_frame
+        if post_cut:
+            active_tex = cut_texture
+        panel_offset = np.zeros(3)
+        if post_cut and spec.move_after_cut:
+            u = min(1.0, (i - spec.cut_frame) / max(1, spec.n_frames - spec.cut_frame))
+            panel_offset = np.array([0.42 * u, 0.22 * u, 0.0])
         frame = np.zeros((FRAME_H, FRAME_W, 3), np.uint8)
         # wall
         wp = project_points(wall_world, K, R, C)
@@ -454,8 +531,11 @@ def render_clip(outdir: str, spec: ClipSpec, seed: int = 5, encode: bool = True)
         wmask = cv2.warpPerspective(np.full(wall_tex.shape[:2], 255, np.uint8), H_wall, (FRAME_W, FRAME_H))
         frame[wmask > 0] = wall_warp[wmask > 0]
         # screen
-        H_screen = screen_homography(K, R, C)
-        screen_warp = cv2.warpPerspective(screen_tex, H_screen, (FRAME_W, FRAME_H))
+        if post_cut and spec.move_after_cut:
+            H_screen = moved_screen_homography(K, R, C, panel_offset)
+        else:
+            H_screen = screen_homography(K, R, C)
+        screen_warp = cv2.warpPerspective(active_tex, H_screen, (FRAME_W, FRAME_H))
         smask = cv2.warpPerspective(np.full((SCREEN_H, SCREEN_W), 255, np.uint8), H_screen,
                                     (FRAME_W, FRAME_H))
         gain = 0.96 + 0.04 * math.sin(2 * math.pi * 1.7 * t + 0.3)
@@ -466,10 +546,28 @@ def render_clip(outdir: str, spec: ClipSpec, seed: int = 5, encode: bool = True)
                                           np.float64))
         cv2.polylines(frame, [np.round(quad).astype(np.int32)], True, (22, 24, 28), 3, cv2.LINE_AA)
 
+        # half-screen hand occlusion (degeneracy regression): a hand covers the
+        # left half of the panel for a window. In the narrow-angle view the
+        # surviving right-side features are compressed into a thin band, so the
+        # frame is tracked only while the homography stays well conditioned;
+        # when the evidence collapses the frame fails and later relinks.
+        if spec.hand_half:
+            hh0, hh1 = _hand_half_window(i, spec.n_frames)
+            if hh0 is not None:
+                hand_tex_mask = np.zeros((SCREEN_H, SCREEN_W), np.uint8)
+                hand_tex_mask[:, : int(SCREEN_W * 0.55)] = 255
+                Hh = H_screen
+                hm = cv2.warpPerspective(hand_tex_mask, Hh, (FRAME_W, FRAME_H)) > 0
+                frame[hm] = (78 + int(10 * math.sin(i)), 66, 58)
+                hand_mask = hm
+            else:
+                hand_mask = np.zeros((FRAME_H, FRAME_W), bool)
+        else:
+            hand_mask = np.zeros((FRAME_H, FRAME_W), bool)
+
         occ = _occluder_state(spec, i, spec.n_frames)
         person_mask = np.zeros((FRAME_H, FRAME_W), bool)
         board_mask = np.zeros((FRAME_H, FRAME_W), bool)
-        hand_mask = np.zeros((FRAME_H, FRAME_W), bool)
         occ_quads = {}
 
         if occ["person"] is not None:
@@ -491,7 +589,7 @@ def render_clip(outdir: str, spec: ClipSpec, seed: int = 5, encode: bool = True)
             if p["opacity"] > 0.01:
                 warp_rgba(frame, person, Hp)
 
-        if occ["hand"] is not None:
+        if occ["hand"] is not None and not spec.hand_half:
             hd = occ["hand"]
             # keep a solid mark on the screen frame, blending only while moving
             u_hand = hd["u"]
@@ -561,6 +659,9 @@ def render_clip(outdir: str, spec: ClipSpec, seed: int = 5, encode: bool = True)
             "occ_hand": bool(hand_mask.any()),
             "occ_board": bool(board_mask.any()),
             "occluders": occ_quads,
+            "source_cut": bool(cut_now),
+            "post_cut": bool(post_cut),
+            "moved_panel": bool(post_cut and spec.move_after_cut),
         })
 
     truth = {
@@ -572,6 +673,9 @@ def render_clip(outdir: str, spec: ClipSpec, seed: int = 5, encode: bool = True)
         "frames": truth_frames,
         "content": "content.png",
         "screen": "screen.png",
+        "cut_frame": spec.cut_frame,
+        "narrow": bool(spec.narrow),
+        "cut_screen": "cut_screen.png" if spec.cut_frame is not None else None,
     }
 
     if encode:
@@ -625,6 +729,14 @@ CLIPS = {
     "occlusion": ClipSpec("occlusion", "standard", 170, "person"),
     "full_board": ClipSpec("full_board", "standard", 140, "full"),
     "corner_texture": ClipSpec("corner_texture", "corner", 140, "none"),
+    # narrow-angle view with a half-screen hand: surviving features approach a
+    # collinear band and the degenerate-homography gate must hold
+    "narrow_hand": ClipSpec("narrow_hand", "standard", 120, "none",
+                            narrow=True, hand_half=True),
+    # source cut mid-occlusion: new material and a repositioned panel, so the
+    # old keyframe cannot be reused and tracking must start a fresh leg
+    "cut_move": ClipSpec("cut_move", "standard", 140, "none",
+                         narrow=True, cut_frame=70, move_after_cut=True),
 }
 
 

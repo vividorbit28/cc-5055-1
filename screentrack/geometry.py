@@ -47,6 +47,50 @@ def homography_dlt(src: np.ndarray, dst: np.ndarray, weights: np.ndarray | None 
     return H
 
 
+def point_spread_2d(pts: np.ndarray) -> float:
+    """Smallest normalized spread of a point set.
+
+    Zero (or near zero) means the points are (near-)collinear: a homography
+    solved from them has an unconstrained projective direction and its
+    off-line extrapolation is meaningless, even when every inlier residual
+    on the line is sub-pixel.
+    """
+    pts = np.asarray(pts, dtype=np.float64)
+    if len(pts) < 4:
+        return 0.0
+    _, norm = normalize_points(pts)
+    sv = np.linalg.svd(norm - norm.mean(axis=0), compute_uv=False)
+    return float(sv[-1])
+
+
+def homography_condition(src: np.ndarray, dst: np.ndarray) -> dict:
+    """Conditioning of a homography estimated from `src` -> `dst`.
+
+    `design_min_sv` is the smallest singular value of the normalized DLT
+    design matrix; a value near zero marks a rank-deficient (degenerate)
+    solve. `src_spread` / `dst_spread` are the 2-D point-set spreads, which
+    catch a near-collinear band before the matrix singular values do.
+    """
+    src = np.asarray(src, dtype=np.float64)
+    dst = np.asarray(dst, dtype=np.float64)
+    _, sn = normalize_points(src)
+    _, dn = normalize_points(dst)
+    n = len(sn)
+    A = np.zeros((2 * n, 9))
+    for i in range(n):
+        x, y = sn[i]
+        u, v = dn[i]
+        A[2 * i] = [-x, -y, -1, 0.0, 0.0, 0.0, u * x, u * y, u]
+        A[2 * i + 1] = [0.0, 0.0, 0.0, -x, -y, -1, v * x, v * y, v]
+    sv = np.linalg.svd(A, compute_uv=False)
+    return {
+        "design_min_sv": float(sv[-1]),
+        "design_ratio": float(sv[0] / max(sv[-1], 1e-12)),
+        "src_spread": point_spread_2d(src),
+        "dst_spread": point_spread_2d(dst),
+    }
+
+
 def apply_h(H: np.ndarray, pts: np.ndarray) -> np.ndarray:
     pts = np.asarray(pts, dtype=np.float64).reshape(-1, 2)
     hom = np.hstack([pts, np.ones((pts.shape[0], 1))]) @ H.T

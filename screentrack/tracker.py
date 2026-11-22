@@ -36,8 +36,8 @@ from dataclasses import asdict, dataclass, field
 import cv2
 import numpy as np
 
-from .geometry import (apply_h, corner_order, h_from_quad, homography_dlt,
-                       polygon_area, quad_from_h)
+from .geometry import (apply_h, corner_order, h_from_quad, homography_condition,
+                       homography_dlt, point_spread_2d, polygon_area, quad_from_h)
 
 
 @dataclass
@@ -68,6 +68,11 @@ class TrackConfig:
     rekey_every: int = 14
     rekey_min_inliers: int = 16
     rekey_max_occlusion: float = 0.03
+    # Near-collinear correspondences leave the homography's projective
+    # direction unconstrained. The normalized point-set spread (0 = collinear)
+    # and the smallest normalized DLT singular value gate those solves.
+    min_point_spread: float = 0.22
+    min_design_sv: float = 1e-3
 
     def to_dict(self):
         d = asdict(self)
@@ -535,6 +540,38 @@ class Observation:
     reject_counts: dict
     photometric_ncc: float = 0.0
     expected_coverage: float = 1.0
+    degeneracy: dict | None = None
+
+
+def _homography_degenerate(pts_tex: np.ndarray, pts_img: np.ndarray,
+                           cfg: TrackConfig) -> dict | None:
+    """Return a diagnostic dict when the correspondences cannot pin down a
+    homography (near-collinear band / rank-poor DLT), else None.
+
+    Inlier residuals stay small along the band regardless of the projective
+    term, so reprojection error alone cannot detect this. The gate rejects the
+    solve and lets the frame fall through to prediction/pause instead of
+    accepting an invalid homography as a new successful observation.
+    """
+    cond = homography_condition(pts_tex, pts_img)
+    # Point-set spread is the primary degeneracy cue. The DLT design-matrix
+    # singular value alone is not: for an exactly affine motion (h31=h32=0)
+    # the last singular value is structurally zero even when the points tile
+    # the plane. Only a numerically near-zero SV that is not an exact
+    # structural zero counts as extra rank evidence.
+    spread_ok = (cond["dst_spread"] >= cfg.min_point_spread and
+                 cond["src_spread"] >= cfg.min_point_spread)
+    rank_poor = (spread_ok and 1e-12 < cond["design_min_sv"] < cfg.min_design_sv)
+    if spread_ok and not rank_poor:
+        return None
+    return {
+        "reason": "near_collinear_correspondences",
+        "dst_spread": round(cond["dst_spread"], 4),
+        "src_spread": round(cond["src_spread"], 4),
+        "design_min_sv": round(cond["design_min_sv"], 6),
+        "design_ratio": round(cond["design_ratio"], 1),
+        "n_points": int(len(pts_tex)),
+    }
 
 
 def _match_candidates(ref: ReferenceModel, gray: np.ndarray, H_pred, cfg: TrackConfig,
@@ -578,7 +615,8 @@ def _match_candidates(ref: ReferenceModel, gray: np.ndarray, H_pred, cfg: TrackC
 
 def _solve_observation(frame: np.ndarray, ref: ReferenceModel, cfg: TrackConfig,
                        H_pred, gate_px, roi_mask, search_px: float,
-                       occ_ref: ReferenceModel | None = None) -> Observation | None:
+                       occ_ref: ReferenceModel | None = None,
+                       diag: dict | None = None) -> Observation | None:
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     matched = _match_candidates(ref, gray, H_pred, cfg, gate_px, roi_mask)
     if matched is None:
@@ -615,6 +653,12 @@ def _solve_observation(frame: np.ndarray, ref: ReferenceModel, cfg: TrackConfig,
     if keep.sum() < 4:
         return None
     rp, ip = pts_tex[keep], pts_img[keep]
+    degeneracy = _homography_degenerate(rp, ip, cfg)
+    if degeneracy is not None:
+        if diag is not None:
+            diag["degeneracy"] = degeneracy
+            diag["n_photometric_inliers"] = int(len(rp))
+        return None
     H = homography_dlt(rp, ip)
     if not np.isfinite(H).all() or not _quad_valid(quad_from_h(H, *ref.tex_size),
                                                    frame.shape[:2], ref.quad):
@@ -746,7 +790,43 @@ def _record_stub(frame_idx: int, pred_quad):
         "predicted_quad": pred_quad.tolist() if pred_quad is not None else None,
         "keyframe": None, "corners_found": 0, "photometric_ncc": None,
         "sigma_frac": None,
+        "source_cut": False, "track_break": None, "relink": None,
+        "observation_generation": None, "degeneracy": None,
     }
+
+
+def _detect_source_cut(prev_gray: np.ndarray, gray: np.ndarray,
+                       H_tex_cur: np.ndarray | None, ref: ReferenceModel | None,
+                       cfg: TrackConfig) -> bool:
+    """A hard cut swaps the source material: frame difference spikes inside the
+    screen polygon even though the global mean can stay modest (the panel only
+    covers part of the frame and the wall never changes).
+
+    Occlusion disagrees only where a foreground object crosses the panel; a
+    content swap breaks agreement across the whole screen interior at once.
+    The screen-region frame difference is therefore the primary cue, with a
+    global fallback when no current homography is available.
+    """
+    if prev_gray is None or prev_gray.shape != gray.shape:
+        return False
+    g_prev = cv2.GaussianBlur(prev_gray, (5, 5), 0)
+    g_cur = cv2.GaussianBlur(gray, (5, 5), 0)
+    frame_diff = np.abs(g_prev.astype(np.float32) - g_cur.astype(np.float32))
+    global_change = float(np.mean(frame_diff))
+    if H_tex_cur is None or ref is None:
+        return global_change >= 24.0
+    fh, fw = gray.shape
+    screen_mask = cv2.warpPerspective(np.full((ref.tex_size[1], ref.tex_size[0]), 255, np.uint8),
+                                      H_tex_cur, (fw, fh), flags=cv2.INTER_NEAREST) > 0
+    if int(screen_mask.sum()) < 200:
+        return global_change >= 24.0
+    screen_change = float(np.mean(frame_diff[screen_mask]))
+    if screen_change < 18.0:
+        return False
+    # Confirm it is a content swap rather than an occluder: an occluder changes
+    # only part of the panel, so a large fraction of the screen must disagree.
+    changed_frac = float(np.mean(frame_diff[screen_mask] > 18.0))
+    return changed_frac >= 0.55
 
 
 def _fill_observation(record: dict, obs: Observation, conf: float, label: str, sigma_frac: float):
@@ -810,11 +890,18 @@ def track_path(source: str, start_frame: int, quad: np.ndarray, cfg: TrackConfig
     prev_state = "anchor"
     events = []
     occluded_since = None
-    paused_since = None
     stats = {"tracking": 0, "weak": 0, "tracking_partial": 0, "predicted": 0, "paused": 0,
              "reacquired": 0, "total": 0}
     last_key_idx = start_frame
     last_quad = quad0.copy()
+    # Observation generation: bumped on every accepted observation so a stale
+    # homography that resolves late can never overwrite a newer manual fix.
+    observation_generation = 0
+    last_accepted_generation = 0
+    # Track-break / relink bookkeeping for the per-frame export.
+    break_start = None
+    source_cut_frame = None
+    prev_track_gray = gray0.copy()
 
     i = start_frame + 1
     while i < end_frame:
@@ -824,6 +911,18 @@ def track_path(source: str, start_frame: int, quad: np.ndarray, cfg: TrackConfig
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         pred_quad = _predict_quad(history, i)
         pred_H = h_from_quad(pred_quad, *tex_size) if pred_quad is not None else None
+        # Source-cut detection runs before matching: a content swap invalidates
+        # every descriptor match against the old keyframe, so the frame must
+        # start a fresh tracking leg rather than be forced onto the old plane.
+        cut_H = None
+        if last_quad is not None:
+            cut_H = h_from_quad(last_quad, *tex_size)
+        is_cut = _detect_source_cut(prev_track_gray, gray, cut_H, key_ref, cfg)
+        if is_cut:
+            source_cut_frame = i
+            if break_start is None:
+                break_start = i
+            events.append({"frame": i, "event": "source_cut"})
         diag = float(np.linalg.norm(quad0[2] - quad0[0]))
         gate_frac = min(cfg.gate_frac_max, cfg.gate_frac + cfg.gate_frac_slope * age)
         gate_px = gate_frac * diag if age <= cfg.max_predict + 2 else None
@@ -832,17 +931,48 @@ def track_path(source: str, start_frame: int, quad: np.ndarray, cfg: TrackConfig
         corner_search = float(np.clip((cfg.corner_search_frac * (1 + 0.12 * age)) * diag, 10, 150))
 
         obs = None
+        solve_diag = {}
+        # After a source cut the old keyframe descriptors describe content that
+        # no longer exists, so a feature match would be coincidental. Start a
+        # fresh tracking leg: build a reference from the new material using the
+        # predicted quad as its anchor. The cut frame still counts as a break;
+        # relink is only marked once the new reference yields an observation.
+        cut_pending = is_cut
+        if cut_pending:
+            new_anchor = None
+            if pred_quad is not None and _quad_valid(pred_quad, (height, width), quad0,
+                                                     margins=0.9):
+                try:
+                    new_anchor = build_reference(frame, pred_quad, cfg, i,
+                                                 tex_size=tex_size, anchor=anchor)
+                except ValueError:
+                    new_anchor = None
+            if new_anchor is not None:
+                anchor = new_anchor
+                key_ref = new_anchor
+                # prediction history described the old leg; the new leg restarts
+                history = deque([(i, pred_quad.copy())], maxlen=4)
+            else:
+                key_ref = anchor
         refs_to_try = [key_ref] if key_ref is anchor else [key_ref, anchor]
         for ref in refs_to_try:
             obs = _solve_observation(frame, ref, cfg, pred_H if ref is key_ref else None,
                                      gate_px if ref is key_ref else None,
                                      search_hint if ref is key_ref else None, corner_search,
-                                     occ_ref=anchor)
+                                     occ_ref=anchor, diag=solve_diag)
             if obs is not None:
                 key_ref = ref
                 break
+        # The cut frame itself opens the break even if the freshly built
+        # reference already matches: relink belongs to the first frame after
+        # the cut so the export shows a clear break -> relink boundary.
+        if cut_pending:
+            obs = None
 
         record = _record_stub(i, pred_quad)
+        record["source_cut"] = bool(is_cut)
+        if solve_diag.get("degeneracy") is not None:
+            record["degeneracy"] = solve_diag["degeneracy"]
         accepted = False
         if obs is not None:
             precise, conf, label, sigma_frac = _precision(obs, cfg, anchor)
@@ -863,13 +993,28 @@ def track_path(source: str, start_frame: int, quad: np.ndarray, cfg: TrackConfig
             well_conditioned = sigma_frac <= cfg.max_corner_sigma_frac
             observable = (strong_support and n_vis >= 2 and well_conditioned and
                           (occ_cov >= 0.55 or obs.coverage >= 0.5 or visible_ok))
-            if observable:
+            # Corner templates can transiently fail to match in a narrow view even
+            # though the feature evidence is strong and well spread. A single
+            # corner-template miss must not open a track break on its own: accept
+            # the feature-driven homography, but only when the plane is clearly
+            # visible, well conditioned and spatially supported. The degenerate
+            # (near-collinear) case was already rejected before this point.
+            strong_feature_fallback = (not observable and strong_support and well_conditioned and
+                                       obs.occlusion < cfg.occlusion_clear and
+                                       obs.coverage >= 0.5 and n_vis >= 1)
+            if observable or strong_feature_fallback:
                 accepted = True
                 if obs.occlusion >= cfg.occlusion_hidden:
                     record.update(state="tracking_partial", precision="partial",
                                   decision="observe",
                                   note=f"screen over half occluded ({obs.occlusion:.0%}); "
                                        f"{n_vis}/4 corners verified, using the partial observation")
+                    last_precise = False
+                elif strong_feature_fallback:
+                    record.update(state="weak", precision="partial", decision="observe",
+                                  note=f"strong feature support ({obs.n_inliers} inliers, coverage "
+                                       f"{obs.coverage:.0%}) but only {n_vis}/4 corner templates "
+                                       "matched; accepting the feature homography at reduced label")
                     last_precise = False
                 elif precise:
                     record.update(state="tracking", precision="full", decision="observe")
@@ -909,6 +1054,17 @@ def track_path(source: str, start_frame: int, quad: np.ndarray, cfg: TrackConfig
                     age += 1
                     prev_state = "paused"
             if accepted:
+                observation_generation += 1
+                last_accepted_generation = observation_generation
+                record["observation_generation"] = observation_generation
+                if break_start is not None:
+                    record["relink"] = {
+                        "break_frame": break_start, "relink_frame": i,
+                        "gap": i - break_start, "via_source_cut": source_cut_frame == break_start,
+                    }
+                    events.append({"frame": i, "event": "relink",
+                                   "break_frame": break_start, "gap": i - break_start})
+                    break_start = None
                 last_obs_frame = i
                 last_quad = obs.quad.copy()
                 history.append((i, obs.quad.copy()))
@@ -941,6 +1097,17 @@ def track_path(source: str, start_frame: int, quad: np.ndarray, cfg: TrackConfig
                                "gap": i - last_obs_frame, "corners_verified": 4})
                 stats["reacquired"] += 1
                 accepted = True
+                observation_generation += 1
+                last_accepted_generation = observation_generation
+                record["observation_generation"] = observation_generation
+                if break_start is not None:
+                    record["relink"] = {
+                        "break_frame": break_start, "relink_frame": i,
+                        "gap": i - break_start, "via_source_cut": source_cut_frame == break_start,
+                    }
+                    events.append({"frame": i, "event": "relink",
+                                   "break_frame": break_start, "gap": i - break_start})
+                    break_start = None
                 last_obs_frame = i
                 last_quad = quad.copy()
                 history.append((i, quad.copy()))
@@ -980,8 +1147,18 @@ def track_path(source: str, start_frame: int, quad: np.ndarray, cfg: TrackConfig
         else:
             stats[record["state"]] = stats.get(record["state"], 0) + 1
         stats["total"] += 1
+
+        # Track-break bookkeeping. A frame without an accepted observation opens
+        # (or extends) a break; the next accepted frame carries the relink. The
+        # failure state belongs to the current frame only -- the previous good
+        # frame is never re-announced as a fresh successful track.
+        if not accepted:
+            if break_start is None:
+                break_start = i
+            record["track_break"] = {"start": break_start, "age": i - break_start}
         record["foreground"] = _foreground_polys(record, anchor, tex_size, cfg.occlusion_grid)
         frames_out.append(record)
+        prev_track_gray = gray.copy()
 
         # promote a keyframe from a confidently tracked frame, but only when the
         # screen is essentially unoccluded: otherwise the occluder is baked into
@@ -1004,6 +1181,8 @@ def track_path(source: str, start_frame: int, quad: np.ndarray, cfg: TrackConfig
 
     cap.release()
 
+    relinks = [e for e in events if e["event"] == "relink"]
+    cuts = [e["frame"] for e in events if e["event"] == "source_cut"]
     result = {
         "version": 1,
         "source": os.path.basename(source),
@@ -1018,6 +1197,10 @@ def track_path(source: str, start_frame: int, quad: np.ndarray, cfg: TrackConfig
         "frames": frames_out,
         "events": events,
         "stats": stats,
+        "source_cuts": cuts,
+        "relinks": relinks,
+        "open_break": ({"start": break_start, "age": (i - 1) - break_start}
+                       if break_start is not None else None),
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     if out_path:

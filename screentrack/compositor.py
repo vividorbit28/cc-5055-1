@@ -134,6 +134,23 @@ def _draw_hud(frame: np.ndarray, rec: dict, gt: dict | None, show_features: bool
     if rec.get("note"):
         cv2.putText(out, rec["note"][:86], (12, 18 * len(lines) + 22),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+    # Track lifecycle evidence: a cut swaps the source material, a break withholds
+    # the overlay, a relink is the first frame where re-texturing is re-permitted.
+    tags = []
+    if rec.get("source_cut"):
+        tags.append("SOURCE CUT")
+    if rec.get("track_break"):
+        tags.append(f"BREAK age {rec['track_break']['age']}")
+    if rec.get("relink"):
+        tags.append(f"RELINK gap {rec['relink']['gap']}"
+                    + (" (fresh leg)" if rec["relink"].get("via_source_cut") else ""))
+    if rec.get("degeneracy"):
+        tags.append("DEGENERATE: " + rec["degeneracy"].get("reason", ""))
+    if rec.get("observation_generation") is not None:
+        tags.append(f"obs gen {rec['observation_generation']}")
+    if tags:
+        cv2.putText(out, "  |  ".join(tags), (12, out.shape[0] - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 255), 1, cv2.LINE_AA)
     return out
 
 
@@ -187,6 +204,12 @@ def composite_track(source: str, track: dict, content: np.ndarray, outdir: str,
     if diag_frames:
         cv2.imwrite(preview_path, diag_frames[len(diag_frames) // 2])
     first_used = next((i for i in sorted(records) if quads.get(i) is not None), None)
+    relinks = track.get("relinks", [])
+    # first frame after each break where the overlay is re-permitted
+    retextured = [e["frame"] for e in relinks]
     return {"video": os.path.basename(out_path), "diagnostics": os.path.basename(diag_path),
             "preview": os.path.basename(preview_path), "frames_with_overlay": used,
-            "frames_total": len(frames)}
+            "frames_total": len(frames), "first_overlay_frame": first_used,
+            "source_cuts": track.get("source_cuts", []),
+            "retextured_first_frames": retextured,
+            "open_break": track.get("open_break")}

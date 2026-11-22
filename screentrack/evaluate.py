@@ -75,6 +75,8 @@ def evaluate(track: dict, truth: dict, config: dict | None = None) -> dict:
     gt_paused, est_paused = 0, 0
     paused_while_visible = 0
     overlay_when_paused_gt = 0
+    degenerate_frames, breaks_opened, relinks_seen = [], 0, 0
+    generations = []
     for f in common:
         rec, gt = records[f], gt_frames[f]
         est = rec.get("quad")
@@ -109,9 +111,22 @@ def evaluate(track: dict, truth: dict, config: dict | None = None) -> dict:
             paused_while_visible += 1
         if (not is_paused) and should_pause:
             overlay_when_paused_gt += 1
+        if rec.get("degeneracy"):
+            degenerate_frames.append(f)
+        if rec.get("track_break") and rec["track_break"].get("age", 1) == 0:
+            breaks_opened += 1
+        if rec.get("relink"):
+            relinks_seen += 1
+        if rec.get("observation_generation") is not None:
+            generations.append(rec["observation_generation"])
         state_rows.append({"frame": f, "state": rec["state"], "gt_occlusion": gt["occlusion"],
                            "gt_corners_visible": int(sum(gt["corner_visible"])),
-                           "corner_err": m["corner_err_mean"]})
+                           "corner_err": m["corner_err_mean"],
+                           "source_cut": bool(rec.get("source_cut")),
+                           "track_break": rec.get("track_break"),
+                           "relink": rec.get("relink"),
+                           "degeneracy": rec.get("degeneracy"),
+                           "observation_generation": rec.get("observation_generation")})
     valid = [e for e in errs if e is not None]
     metrics = {
         "frames": len(common),
@@ -133,6 +148,14 @@ def evaluate(track: dict, truth: dict, config: dict | None = None) -> dict:
         "overlay_when_gt_fully_occluded": overlay_when_paused_gt,
         "honesty_cases": scorable_corner_cases,
         "honest_cases": honest_corner_cases,
+        "source_cut_frames": list(track.get("source_cuts", [])),
+        "relink_frames": [e["frame"] for e in track.get("relinks", [])],
+        "breaks_opened": breaks_opened,
+        "relinks_closed": relinks_seen,
+        "degenerate_frames": degenerate_frames,
+        "open_break": track.get("open_break"),
+        "observation_generation_monotonic": generations == sorted(generations)
+        and len(set(generations)) == len(generations),
     }
     metrics["fidelity"] = _fidelity(metrics)
     return {"metrics": metrics, "per_frame": state_rows}

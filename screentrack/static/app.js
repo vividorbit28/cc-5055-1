@@ -467,6 +467,24 @@ function drawSide(rec) {
   }
   for (const [k, v] of rows) kv.append(el('div', { class: 'k' }, [k]), el('div', { class: 'num' }, [String(v)]));
   side.append(kv);
+  if (rec.observation_generation != null) {
+    side.append(el('h3', { style: 'margin-top:10px' }, ['Track lifecycle']));
+    const lk = el('div', { class: 'kv' });
+    const addL = (k, v) => lk.append(el('div', { class: 'k' }, [k]), el('div', { class: 'num' }, [String(v)]));
+    addL('observation generation', rec.observation_generation);
+    if (rec.source_cut) addL('source cut', 'frame ' + rec.frame);
+    if (rec.track_break) addL('track break', `since ${rec.track_break.start} (age ${rec.track_break.age})`);
+    if (rec.relink) addL('relink', `break ${rec.relink.break_frame} → ${rec.relink.relink_frame}`
+      + (rec.relink.via_source_cut ? ' (fresh leg after cut)' : ''));
+    side.append(lk);
+  }
+  if (rec.degeneracy) {
+    side.append(el('div', { class: 'alert', style: 'margin-top:8px' }, [
+      `Degenerate solve rejected: ${rec.degeneracy.reason} `
+      + `(point spread ${rec.degeneracy.dst_spread}, design SV ${rec.degeneracy.design_min_sv}). `
+      + 'No overlay produced from this frame.',
+    ]));
+  }
   if (rec.note) side.append(el('div', { class: 'hint' }, [rec.note]));
   if (rec.reject_counts && Object.keys(rec.reject_counts).length) {
     side.append(el('h3', { style: 'margin-top:10px' }, ['Rejected matches']));
@@ -481,8 +499,13 @@ function drawTimeline() {
   tl.innerHTML = '';
   tl.style.gridTemplateColumns = `repeat(${Math.min(60, STATE.track.frames.length)}, 1fr)`;
   for (const rec of STATE.track.frames) {
+    const marks = [];
+    if (rec.source_cut) marks.push('cut');
+    if (rec.relink) marks.push('relink');
+    if (rec.track_break && rec.track_break.age === 0) marks.push('break');
     const cell = el('div', {
-      class: 'cell', title: `frame ${rec.frame}: ${rec.state}`,
+      class: 'cell' + (rec.source_cut ? ' cut' : '') + (rec.relink ? ' relink' : ''),
+      title: `frame ${rec.frame}: ${rec.state}` + (marks.length ? ' (' + marks.join(', ') + ')' : ''),
       style: `background:${STATE_COLORS[rec.state] || '#555'};height:11px`,
     });
     cell.addEventListener('click', () => {
@@ -532,6 +555,19 @@ function renderReport(ws) {
   const s = el('div', { class: 'kv' });
   for (const [k, v] of Object.entries(stats)) s.append(el('div', { class: 'k' }, [k]), el('div', { class: 'num' }, [String(v)]));
   panel.append(s);
+  const lifecycle = [];
+  if (track.source_cuts && track.source_cuts.length) lifecycle.push(['source cuts', track.source_cuts.join(', ')]);
+  if (track.relinks && track.relinks.length) {
+    lifecycle.push(['relinks (overlay re-permitted)', track.relinks
+      .map((e) => `${e.frame} (break ${e.break_frame}, gap ${e.gap})`).join('; ')]);
+  }
+  if (track.open_break) lifecycle.push(['open break', `from ${track.open_break.start}`]);
+  if (lifecycle.length) {
+    panel.append(el('h3', { style: 'margin-top:12px' }, ['Track breaks & relinks']));
+    const lk = el('div', { class: 'kv' });
+    for (const [k, v] of lifecycle) lk.append(el('div', { class: 'k' }, [k]), el('div', { class: 'num' }, [v]));
+    panel.append(lk);
+  }
   if (ev) {
     panel.append(el('h3', { style: 'margin-top:12px' }, ['Ground-truth comparison']));
     const m = ev.metrics;
@@ -549,6 +585,9 @@ function renderReport(ws) {
     add('overlay slip (p95)', `${fmt(ev.slip && ev.slip.slip_px_p95)} px`);
     add('honesty cases', `${m.honest_cases} / ${m.honesty_cases}`);
     add('grade', ev.metrics.fidelity ? `${ev.metrics.fidelity.grade} (${ev.metrics.fidelity.score})` : 'n/a');
+    if (m.breaks_opened != null) add('breaks opened / relinked', `${m.breaks_opened} / ${m.relinks_closed}`);
+    if (m.degenerate_frames && m.degenerate_frames.length) add('degenerate frames rejected', m.degenerate_frames.join(', '));
+    add('observation generation monotonic', m.observation_generation_monotonic ? 'yes' : 'NO');
     panel.append(mk);
     if (ev.slip) panel.append(el('div', { class: 'hint' }, [`Overlay slip compares the composited content against the true plane over ${ev.slip.samples} sampled frames.`]));
     const dec = ev.decisions;
